@@ -1,0 +1,50 @@
+<video id="camera" autoplay playsinline muted></video>
+<button id="startCamera">Start Camera</button>
+<p id="status">Ready to start.</p>
+
+<script type="module">
+  const button = document.getElementById("startCamera");
+  const video = document.getElementById("camera");
+  const status = document.getElementById("status");
+
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+
+    try {
+      status.textContent = "Loading face model...";
+
+      if (!window.initializeFaceModel) {
+        throw new Error("MediaPipe module did not load.");
+      }
+
+      const faceLandmarker =
+        await window.initializeFaceModel();
+
+      status.textContent = "Requesting camera access...";
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "user",
+          width: { ideal: 640 },
+          height: { ideal: 480 }
+        },
+        audio: false
+      });
+
+      video.srcObject = stream;
+      await video.play();
+
+      status.textContent =
+        "Camera started. Face model is ready.";
+
+      // Connect faceLandmarker to your existing
+      // eye aspect ratio and drowsiness detection loop.
+      console.log("Ready for video detection", faceLandmarker);
+
+    } catch (error) {
+      console.error(error);
+      status.textContent = "Error: " + error.message;
+      button.disabled = false;
+    }
+  });
+</script>
