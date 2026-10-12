@@ -1,0 +1,38 @@
+<script type="module">
+  import {
+    FilesetResolver,
+    FaceLandmarker
+  } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/vision_bundle.mjs";
+
+  console.log("MediaPipe Vision module loaded successfully");
+
+  async function initializeFaceModel() {
+    try {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm"
+      );
+
+      const faceLandmarker =
+        await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+          },
+          runningMode: "VIDEO",
+          numFaces: 1,
+          outputFaceBlendshapes: true
+        });
+
+      console.log("Face model initialized successfully");
+      return faceLandmarker;
+
+    } catch (error) {
+      console.error("Face model initialization failed:", error);
+      throw error;
+    }
+  }
+
+  // Call this when your app starts detection.
+  // Store the returned object in your existing detection logic.
+  window.initializeFaceModel = initializeFaceModel;
+</script>
