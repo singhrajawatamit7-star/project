@@ -568,6 +568,13 @@
           </tbody>
         </table>
       </div>
+      <div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-top:0.75rem;align-items:center;">
+        <button class="btn btn-secondary" onclick="exportTelemetryCSV()">Export CSV</button>
+        <button class="btn btn-secondary" onclick="window.open('/api/predictions?format=csv')">Server predictions CSV</button>
+        <button class="btn btn-secondary" onclick="window.open('/api/alerts?format=csv')">Server alerts CSV</button>
+        <button class="btn btn-secondary" onclick="clearTelemetry()">Clear records</button>
+        <span id="telemetry-count" style="font-size:0.8rem;color:var(--text-muted);">0 records</span>
+      </div>
     </div>
 
     <!-- Endpoints & Exhibition Links -->
@@ -680,7 +687,7 @@
           const latest = predictions[0];
           document.getElementById('feed-status-text').textContent = "Live Telemetry Feed (Connected)";
           updateDashboardMetrics(latest);
-          renderHistoryTable(predictions.slice(0, 5));
+          if (telemetryLog.length === 0) renderHistoryTable(predictions.slice(0, 5)); // local log takes priority
         } else {
           document.getElementById('feed-status-text').textContent = "Live API Ready (No records posted yet)";
         }
@@ -791,14 +798,29 @@
 
     async function loadLandmarker() {
       if (landmarker) return;
-      const base = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
-      const mod = await import(base);
-      const vision = await mod.FilesetResolver.forVisionTasks(base + "/wasm");
-      landmarker = await mod.FaceLandmarker.createFromOptions(vision, {
-        baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
-        runningMode: "VIDEO",
-        numFaces: 1
-      });
+      // The bare package URL resolves to a CommonJS file that browsers cannot import().
+      // Import the ES-module bundle explicitly, with a second CDN as fallback.
+      const bases = [
+        `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`,
+        `https://unpkg.com/@mediapipe/tasks-vision@${MP_VERSION}`
+      ];
+      let lastErr = null;
+      for (const base of bases) {
+        try {
+          const mod = await import(base + "/vision_bundle.mjs");
+          const vision = await mod.FilesetResolver.forVisionTasks(base + "/wasm");
+          landmarker = await mod.FaceLandmarker.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
+            runningMode: "VIDEO",
+            numFaces: 1
+          });
+          return;
+        } catch (e) {
+          lastErr = e;
+          console.warn("MediaPipe load failed from", base, e);
+        }
+      }
+      throw new Error("Could not load the face model (" + (lastErr && lastErr.message) + "). Check your internet connection or any ad/content blocker.");
     }
 
     function stateRank(s) { return ["normal", "watch", "warning", "critical"].indexOf(s); }
@@ -838,6 +860,49 @@
       }
       if (yawning) st = worst(st, "watch");
       return { perclos, st };
+    }
+
+    // ----- Telemetry record log (kept in this browser; also POSTed to the API) -----
+    const TELEMETRY_KEY = "drowsiness_telemetry_v1";
+    const MAX_TELEMETRY = 500;
+    let telemetryLog = [];
+    try { telemetryLog = JSON.parse(localStorage.getItem(TELEMETRY_KEY) || "[]"); } catch (e) { telemetryLog = []; }
+
+    function addTelemetry(rec) {
+      telemetryLog.push({
+        timestamp: rec.timestamp,
+        ear: +rec.ear.toFixed(3), mar: +rec.mar.toFixed(3), perclos: +rec.perclos.toFixed(3),
+        head_pitch: +rec.head_pitch.toFixed(1), head_yaw: +rec.head_yaw.toFixed(1),
+        alert_state: rec.alert_state, model_version: rec.model_version,
+        latency_ms: Math.round(rec.latency || 0)
+      });
+      if (telemetryLog.length > MAX_TELEMETRY) telemetryLog.shift();
+      try { localStorage.setItem(TELEMETRY_KEY, JSON.stringify(telemetryLog)); } catch (e) {}
+      renderTelemetryLog();
+    }
+
+    function renderTelemetryLog() {
+      document.getElementById('telemetry-count').textContent = telemetryLog.length + " records (showing latest 15)";
+      if (telemetryLog.length === 0) return;
+      renderHistoryTable(telemetryLog.slice(-15).reverse());
+    }
+
+    function exportTelemetryCSV() {
+      if (!telemetryLog.length) { alert("No telemetry records yet. Start the camera first."); return; }
+      const cols = ["timestamp", "ear", "mar", "perclos", "head_pitch", "head_yaw", "alert_state", "model_version", "latency_ms"];
+      const csv = [cols.join(",")].concat(telemetryLog.map(r => cols.map(c => r[c]).join(","))).join("\n");
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+      a.download = "drowsiness_telemetry.csv";
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    function clearTelemetry() {
+      telemetryLog = [];
+      try { localStorage.removeItem(TELEMETRY_KEY); } catch (e) {}
+      document.getElementById('history-rows').innerHTML = '<tr><td colspan="7" style="color: var(--text-muted); text-align: center; padding: 1.25rem;">Waiting for incoming telemetry records...</td></tr>';
+      document.getElementById('telemetry-count').textContent = "0 records";
     }
 
     function detectLoop() {
@@ -902,6 +967,7 @@
             currentState = st;
             lastBeepAt = now;
             setAlertBadgeState(st); // updates badge and plays tone for warning/critical
+            addTelemetry(record); // log state transitions immediately
             if (escalated && elevated) {
               postJSON("/api/alerts", { timestamp: record.timestamp, level: st, channel: "browser_camera",
                 message: `Driver fatigue ${st}: EAR ${ear.toFixed(2)}, PERCLOS ${(perclos * 100).toFixed(0)}%` });
@@ -914,7 +980,7 @@
           if (now - lastPostAt > DETECT.postIntervalMs) {
             lastPostAt = now;
             postJSON("/api/predictions", record);
-            renderHistoryTable([record]);
+            addTelemetry(record);
           }
         }
       }
@@ -972,6 +1038,7 @@
     // Auto-init on load
     window.addEventListener("DOMContentLoaded", () => {
       checkBackend();
+      renderTelemetryLog();
       refreshTelemetry();
       telemetryInterval = setInterval(refreshTelemetry, 2000);
     });
