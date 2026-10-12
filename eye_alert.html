@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eyes-Closed Audio Alert</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --text:#e2e8f0; --muted:#94a3b8; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --accent:#38bdf8; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width: 760px; margin: 0 auto; padding: 1rem; }
+  h1 { font-size: 1.4rem; margin: .5rem 0 1rem; }
+  .card { background: var(--card); border-radius: 12px; padding: 1rem; margin-bottom: 1rem; }
+  .video-wrap { position: relative; background:#000; border-radius: 10px; overflow: hidden; aspect-ratio: 4/3; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit: cover; transform: scaleX(-1); }
+  #idle { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--muted); text-align:center; padding:1rem; }
+  #status { margin-top: .75rem; padding: .8rem; border-radius: 10px; font-weight: 700; text-align:center; background:#334155; transition: background .15s; }
+  #status.ok { background: var(--ok); color:#052e16; }
+  #status.warn { background: var(--warn); color:#451a03; }
+  #status.bad { background: var(--bad); color:#fff; animation: flash .5s infinite alternate; }
+  @keyframes flash { from { filter: brightness(1); } to { filter: brightness(1.4); } }
+  .row { display:flex; flex-wrap:wrap; gap:.75rem; align-items:center; margin-top:.75rem; }
+  button { background: var(--accent); color:#04243a; border:0; padding:.7rem 1.1rem; border-radius:8px; font-weight:700; cursor:pointer; font-size: 1rem; }
+  button.secondary { background:#475569; color:var(--text); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  label { display:block; font-size:.9rem; color:var(--muted); margin-top:.6rem; }
+  input[type=range] { width:100%; }
+  .stats { display:grid; grid-template-columns: repeat(3,1fr); gap:.5rem; margin-top:.75rem; text-align:center; }
+  .stat { background:#0f172a; border-radius:8px; padding:.5rem; }
+  .stat b { display:block; font-size:1.2rem; font-family: ui-monospace, Consolas, monospace; }
+  .stat span { font-size:.75rem; color:var(--muted); }
+  small { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Eyes-Closed Audio Alert</h1>
+
+  <div class="card">
+    <div class="video-wrap">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+      <div id="idle">Click “Start” and allow camera access.<br>The face model loads from the internet (first start takes a few seconds).</div>
+    </div>
+    <div id="status">Not started</div>
+
+    <div class="stats">
+      <div class="stat"><b id="earVal">—</b><span>Eye openness (EAR)</span></div>
+      <div class="stat"><b id="closedVal">0.0 s</b><span>Eyes closed for</span></div>
+      <div class="stat"><b id="alertCount">0</b><span>Alerts this session</span></div>
+    </div>
+
+    <div class="row">
+      <button id="startBtn">Start</button>
+      <button id="stopBtn" class="secondary" disabled>Stop</button>
+      <button id="testBtn" class="secondary">Test sound</button>
+    </div>
+
+    <label>Sound alert after eyes closed for: <b id="durLabel">1.0</b> s
+      <input id="duration" type="range" min="0.3" max="5" step="0.1" value="1.0">
+    </label>
+    <label>Closed-eye sensitivity (EAR below <b id="thrLabel">0.21</b> counts as closed)
+      <input id="threshold" type="range" min="0.10" max="0.35" step="0.01" value="0.21">
+    </label>
+    <label>Volume: <b id="volLabel">70</b>%
+      <input id="volume" type="range" min="0" max="100" step="5" value="70">
+    </label>
+  </div>
+
+  <small>
+    Runs entirely in your browser; video is not uploaded. Open this file through <b>https</b> or <b>localhost</b>
+    (e.g. run <code>python -m http.server 8000</code> in this folder, then visit http://localhost:8000/eye_alert.html).
+    Prototype only; not a certified safety device. Test only while parked.
+  </small>
+</main>
+
+<script>
+const MP_VERSION = "0.10.21";
+const BASES = [
+  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`,
+  `https://unpkg.com/@mediapipe/tasks-vision@${MP_VERSION}`
+];
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const LEFT_EYE  = [33, 160, 158, 133, 153, 144];
+const RIGHT_EYE = [362, 385, 387, 263, 373, 380];
+
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+let landmarker = null, stream = null, running = false, rafId = null, lastVideoTime = -1;
+let closedSince = null, alerting = false, lastBeep = 0, alertCount = 0;
+let audioCtx = null;
+
+// ---- UI labels ----
+$("duration").oninput  = e => $("durLabel").textContent = (+e.target.value).toFixed(1);
+$("threshold").oninput = e => $("thrLabel").textContent = (+e.target.value).toFixed(2);
+$("volume").oninput    = e => $("volLabel").textContent = e.target.value;
+
+function setStatus(text, cls) { const s = $("status"); s.textContent = text; s.className = cls || ""; }
+
+// ---- Audio (must be unlocked by a user click, which Start/Test do) ----
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") audioCtx.resume();
+}
+function beep() {
+  ensureAudio();
+  const vol = (+$("volume").value) / 100;
+  const now = audioCtx.currentTime;
+  [0, 0.22].forEach((offset, i) => {            // two-tone siren pulse
+    const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+    osc.type = "square";
+    osc.frequency.setValueAtTime(i === 0 ? 880 : 660, now + offset);
+    gain.gain.setValueAtTime(0.0001, now + offset);
+    gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, 0.35 * vol), now + offset + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.2);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(now + offset); osc.stop(now + offset + 0.21);
+  });
+  if (navigator.vibrate) navigator.vibrate(200);
+}
+$("testBtn").onclick = beep;
+
+// ---- Model loading (tries two CDNs) ----
+async function loadModel() {
+  if (landmarker) return;
+  let lastErr;
+  for (const base of BASES) {
+    try {
+      const mod = await import(base + "/vision_bundle.mjs");
+      const fileset = await mod.FilesetResolver.forVisionTasks(base + "/wasm");
+      landmarker = await mod.FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: MODEL_URL },
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+      return;
+    } catch (e) { lastErr = e; console.warn("Model load failed from", base, e); }
+  }
+  throw new Error("Could not load the face model (" + (lastErr && lastErr.message) + "). Check internet access / content blockers.");
+}
+
+// ---- Eye aspect ratio ----
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const ear = (lm, i) => (dist(lm[i[1]], lm[i[5]]) + dist(lm[i[2]], lm[i[4]])) / (2 * dist(lm[i[0]], lm[i[3]]));
+
+// ---- Main loop ----
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const result = landmarker.detectForVideo(video, performance.now());
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const lm = result.faceLandmarks && result.faceLandmarks[0];
+    const now = performance.now();
+
+    if (!lm) {
+      closedSince = null; alerting = false;
+      $("earVal").textContent = "—"; $("closedVal").textContent = "0.0 s";
+      setStatus("No face detected — face the camera", "warn");
+    } else {
+      const e = (ear(lm, LEFT_EYE) + ear(lm, RIGHT_EYE)) / 2;
+      const closed = e < +$("threshold").value;
+      $("earVal").textContent = e.toFixed(2);
+
+      ctx.fillStyle = closed ? "#ef4444" : "#22c55e";
+      [...LEFT_EYE, ...RIGHT_EYE].forEach(i => {
+        ctx.beginPath(); ctx.arc(lm[i].x * canvas.width, lm[i].y * canvas.height, 3, 0, 6.283); ctx.fill();
+      });
+
+      if (closed) {
+        if (closedSince === null) closedSince = now;
+        const sec = (now - closedSince) / 1000;
+        $("closedVal").textContent = sec.toFixed(1) + " s";
+        if (sec >= +$("duration").value) {
+          if (!alerting) { alerting = true; alertCount++; $("alertCount").textContent = alertCount; lastBeep = 0; }
+          setStatus("⚠ EYES CLOSED — WAKE UP!", "bad");
+          if (now - lastBeep > 600) { lastBeep = now; beep(); }   // keeps sounding while eyes stay closed
+        } else {
+          setStatus("Eyes closing…", "warn");
+        }
+      } else {
+        closedSince = null; alerting = false;
+        $("closedVal").textContent = "0.0 s";
+        setStatus("Eyes open", "ok");
+      }
+    }
+  }
+  rafId = requestAnimationFrame(loop);
+}
+
+// ---- Start / Stop ----
+$("startBtn").onclick = async () => {
+  $("startBtn").disabled = true;
+  try {
+    ensureAudio();                                   // unlock sound from this click
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+      throw new Error("Camera needs https or localhost.");
+    setStatus("Loading face model…", "");
+    await loadModel();
+    setStatus("Requesting camera…", "");
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    video.srcObject = stream; await video.play();
+    $("idle").style.display = "none";
+    running = true; lastVideoTime = -1; closedSince = null; alerting = false;
+    $("stopBtn").disabled = false;
+    loop();
+  } catch (err) {
+    setStatus("Could not start: " + err.message, "bad");
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null; $("startBtn").disabled = false;
+  }
+};
+$("stopBtn").onclick = () => {
+  running = false; if (rafId) cancelAnimationFrame(rafId);
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; video.srcObject = null;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  $("idle").style.display = "flex";
+  $("startBtn").disabled = false; $("stopBtn").disabled = true;
+  setStatus("Stopped", "");
+};
+</script>
+</body>
+</html>
